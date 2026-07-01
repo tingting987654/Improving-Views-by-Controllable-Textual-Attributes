@@ -1,0 +1,869 @@
+---
+title: '36732516'
+author: "Zixuan Lang"
+date: "2025-12-14"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Read Data
+
+```{r}
+library(dplyr)
+library(tm)
+library(SnowballC)
+library(topicmodels)
+library(slam)
+library(ggplot2)
+library(stats)
+library(dplyr)
+library(tidyr)
+library(cluster)
+library(factoextra)
+library(tidyverse)
+library(reshape2)
+library(tidytext)
+library(ineq)
+library(lsa)
+library(arules)
+library(scales)
+```
+
+```{r cars}
+# import dataset
+setwd("C:\\Users\\lzx\\Desktop")
+data<-read.csv("journal_data_CW4.csv")
+data<-data.frame(data)
+data_selected <- data %>% select(title, journal, abstract, pages, views, doc_number)
+
+```
+
+# Data Preproccess
+
+```{r}
+# Create text corpora
+title_corpus <- Corpus(VectorSource(data_selected$title))
+abstract_corpus <- Corpus(VectorSource(data_selected$abstract))
+
+# Define a common cleaning function
+clean_corpus <- function(corpus){
+  corpus <- tm_map(corpus, content_transformer(tolower))      # Convert to lowercase
+  corpus <- tm_map(corpus, removePunctuation)                 # Remove punctuation
+  corpus <- tm_map(corpus, removeNumbers)                     # Remove numbers
+  corpus <- tm_map(corpus, removeWords, stopwords("english")) # Remove stopwords
+  corpus <- tm_map(corpus, stripWhitespace)                   # Remove extra whitespace
+  corpus <- tm_map(corpus, stemDocument)                      # Apply stemming
+  return(corpus)
+}
+
+# Clean title and abstract corpora
+title_corpus_clean <- clean_corpus(title_corpus)
+abstract_corpus_clean <- clean_corpus(abstract_corpus)
+
+```
+
+# Bag of Words
+
+```{r}
+## =========================
+## 1. Convert title / abstract to long format
+## =========================
+text_data <- data_selected %>%
+  select(doc_number, title, abstract) %>%
+  pivot_longer(
+    cols = c(title, abstract),
+    names_to = "source",
+    values_to = "text"
+  )
+
+## =========================
+## 2. Tokenization + text preprocessing
+## =========================
+tidy_words <- text_data %>%
+  unnest_tokens(word, text) %>%                  # Tokenization + lowercase
+  filter(!str_detect(word, "^[0-9]+$")) %>%      # Remove numbers
+  filter(!str_detect(word, "^[[:punct:]]+$")) %>%# Remove punctuation
+  anti_join(stop_words, by = "word") %>%         # Remove stopwords
+  mutate(
+    word = wordStem(word, language = "english")  # Apply stemming
+  )
+
+## =========================
+## 3. Compute TF
+## =========================
+tf_table <- tidy_words %>%
+  count(doc_number, source, word, name = "tf")
+
+## =========================
+## 4. Compute IDF + TF-IDF
+## =========================
+tf_idf_table <- tf_table %>%
+  unite(doc_id, doc_number, source, remove = FALSE) %>%
+  bind_tf_idf(
+    term = word,
+    document = doc_id,
+    n = tf
+  ) %>%
+  select(-doc_id)
+
+## =========================
+## 5. Merge results (final output)
+## =========================
+final_word_stats <- tf_idf_table %>%
+  arrange(source, doc_number, desc(tf_idf))
+
+title_top_words <- final_word_stats %>%
+  filter(source == "title") %>%            # Title only
+  group_by(word) %>%                       # Aggregate by word
+  summarise(
+    total_tf_idf = sum(tf_idf),             # Total TF-IDF across all documents
+    total_tf     = sum(tf),                 # Total term frequency
+    total_idf    = sum(idf),                # Total IDF
+    n_docs       = n_distinct(doc_number)   # Number of documents containing the word
+  ) %>%
+  arrange(desc(total_tf_idf))               # Sort by total TF-IDF
+
+abstract_top_words <- final_word_stats %>%
+  filter(source == "abstract") %>%
+  group_by(word) %>%
+  summarise(
+    total_tf_idf = sum(tf_idf),             # Total TF-IDF across all documents
+    total_tf     = sum(tf),                 # Total term frequency
+    total_idf    = sum(idf),                # Total IDF
+    n_docs       = n_distinct(doc_number)
+  ) %>%
+  arrange(desc(total_tf_idf))
+
+## =========================
+## 6. Example: inspect results
+## =========================
+
+title_top_words %>% slice_head(n = 10)
+abstract_top_words %>% slice_head(n = 10)
+
+```
+
+# LDA Generate Topic Distribution
+
+```{r}
+# Define the number of topics
+K_title <- 10        # Number of topics for titles
+K_abstract <- 20     # Number of topics for abstracts
+
+# -------------------------------
+# Build Document-Term Matrices (input for LDA)
+# -------------------------------
+dtm_title <- DocumentTermMatrix(
+  title_corpus_clean,
+  control = list(weighting = weightTf)
+)
+
+dtm_abstract <- DocumentTermMatrix(
+  abstract_corpus_clean,
+  control = list(weighting = weightTf)
+)
+
+# -------------------------------
+# Train LDA models
+# -------------------------------
+set.seed(1234)
+lda_title <- LDA(dtm_title, k = K_title, control = list(seed = 1234))
+lda_abstract <- LDA(dtm_abstract, k = K_abstract, control = list(seed = 1234))
+
+
+
+# Retrain LDA models after removing low-frequency components
+# to further prune topics and words and reduce input dimensionality
+
+# ================================
+# Set thresholds
+# ================================
+topic_threshold <- 0.03   # Threshold for average topic proportion across documents
+word_threshold  <- 1e-4   # Threshold for average word probability across topics
+                            # (Dirichlet prior–related filtering)
+
+# ================================
+# Title: filter topics and words
+# ================================
+theta_title <- posterior(lda_title)$topics   # Document–topic distribution
+phi_title   <- posterior(lda_title)$terms    # Topic–word distribution
+
+# Filter topics
+keep_topics_title <- colMeans(theta_title) >= topic_threshold
+K_title_new <- sum(keep_topics_title)
+
+# Filter words
+keep_words_title <- colMeans(phi_title) >= word_threshold
+dtm_title_reduced <- dtm_title[, keep_words_title]
+
+# Remove empty documents
+dtm_title_reduced <- dtm_title_reduced[
+  slam::row_sums(dtm_title_reduced) > 0, 
+]
+
+# ================================
+# Title: retrain LDA
+# ================================
+set.seed(1234)
+lda_title_retrained <- LDA(
+  dtm_title_reduced,
+  k = K_title_new,
+  control = list(seed = 1234)
+)
+
+# Extract updated document–topic and topic–word matrices
+theta_title_new <- posterior(lda_title_retrained)$topics
+phi_title_new   <- posterior(lda_title_retrained)$terms
+
+# ================================
+# Abstract: filter topics and words
+# ================================
+theta_abs <- posterior(lda_abstract)$topics
+phi_abs   <- posterior(lda_abstract)$terms
+
+# Filter topics
+keep_topics_abs <- colMeans(theta_abs) >= topic_threshold
+K_abstract_new <- sum(keep_topics_abs)
+
+# Filter words
+keep_words_abs <- colMeans(phi_abs) >= word_threshold
+dtm_abstract_reduced <- dtm_abstract[, keep_words_abs]
+
+# Remove empty documents
+dtm_abstract_reduced <- dtm_abstract_reduced[
+  slam::row_sums(dtm_abstract_reduced) > 0, 
+]
+
+# ================================
+# Abstract: retrain LDA
+# ================================
+set.seed(1234)
+lda_abstract_retrained <- LDA(
+  dtm_abstract_reduced,
+  k = K_abstract_new,
+  control = list(seed = 1234)
+)
+
+# Extract updated document–topic and topic–word matrices
+theta_abstract_new <- posterior(lda_abstract_retrained)$topics
+phi_abstract_new   <- posterior(lda_abstract_retrained)$terms
+
+```
+
+# LDA Demonstration
+
+```{r}
+# ======================================
+# LDA result visualization: Topic–Word & Document–Topic
+# Dependencies:
+# phi_title_new, phi_abstract_new
+# theta_title_new, theta_abstract_new
+# ======================================
+
+# --------------------------------------
+# 1.Prepare φ (Topic–Word) matrix
+# --------------------------------------
+phi_to_long <- function(phi_matrix, type = "abstract") {
+  phi_df <- as.data.frame(phi_matrix)
+  phi_df$topic <- factor(seq_len(nrow(phi_df)))
+
+  phi_df %>%
+    pivot_longer(
+      cols = -topic,
+      names_to = "term",
+      values_to = "beta"
+    ) %>%
+    mutate(type = type)
+}
+
+phi_abstract_long <- phi_to_long(phi_abstract_new, "abstract")
+phi_title_long    <- phi_to_long(phi_title_new, "title")
+
+# --------------------------------------
+# 2.Top-N words per topic (by β)
+# --------------------------------------
+get_top_words <- function(phi_long, top_n = 10) {
+  phi_long %>%
+    group_by(topic) %>%
+    slice_max(order_by = beta, n = top_n, with_ties = FALSE) %>%
+    ungroup()
+}
+
+top_words_abs   <- get_top_words(phi_abstract_long, top_n = 10)
+top_words_title <- get_top_words(phi_title_long, top_n = 10)
+
+# --------------------------------------
+# 3.Topic–Word visualization (β bar plots)
+# --------------------------------------
+plot_topic_words <- function(top_words_df, title_text) {
+  ggplot(
+    top_words_df,
+    aes(
+      x = reorder(term, beta),
+      y = beta,
+      fill = topic
+    )
+  ) +
+    geom_col(show.legend = FALSE) +
+    coord_flip() +
+    facet_wrap(~ topic, scales = "free") +
+    labs(
+      title = title_text,
+      x = NULL,
+      y = expression(beta)
+    ) +
+    theme_minimal()
+}
+
+plot_topic_words(
+  top_words_abs,
+  "Top words per topic (Abstract, by β)"
+)
+
+plot_topic_words(
+  top_words_title,
+  "Top words per topic (Title, by β)"
+)
+
+# --------------------------------------
+# 4.Prepare θ (Document–Topic proportion)
+# --------------------------------------
+theta_to_long <- function(theta_matrix, type = "abstract") {
+  theta_df <- as.data.frame(theta_matrix)
+  theta_df$document <- seq_len(nrow(theta_df))
+
+  theta_df %>%
+    pivot_longer(
+      cols = -document,
+      names_to = "topic",
+      values_to = "proportion"
+    ) %>%
+    mutate(type = type)
+}
+
+theta_abstract_long <- theta_to_long(theta_abstract_new, "abstract")
+theta_title_long    <- theta_to_long(theta_title_new, "title")
+
+# --------------------------------------
+# 5.Dominant topic per document
+# --------------------------------------
+get_main_topic <- function(theta_long) {
+  theta_long %>%
+    group_by(document) %>%
+    slice_max(order_by = proportion, n = 1, with_ties = FALSE) %>%
+    ungroup()
+}
+
+main_topic_abs   <- get_main_topic(theta_abstract_long)
+main_topic_title <- get_main_topic(theta_title_long)
+
+# --------------------------------------
+# 6.Distribution of dominant topics (Abstract)
+# --------------------------------------
+ggplot(
+  main_topic_abs,
+  aes(x = topic, fill = topic)
+) +
+  geom_bar(show.legend = FALSE) +
+  labs(
+    title = "Distribution of Dominant Topics (Abstract)",
+    x = "Dominant Topic",
+    y = "Number of Documents"
+  ) +
+  theme_minimal()
+
+# --------------------------------------
+# 7.Distribution of dominant topics (Title)
+# --------------------------------------
+ggplot(
+  main_topic_title,
+  aes(x = topic, fill = topic)
+) +
+  geom_bar(show.legend = FALSE) +
+  labs(
+    title = "Distribution of Dominant Topics (Title)",
+    x = "Dominant Topic",
+    y = "Number of Documents"
+  ) +
+  theme_minimal()
+
+```
+
+# K-means Cluster and Visualization
+
+```{r}
+
+
+n <- nrow(data_selected)
+
+# 1.Align rows: pad with zeros
+theta_abstract_full <- matrix(
+  0,
+  nrow = n,
+  ncol = ncol(theta_abstract_new)
+)
+rownames(theta_abstract_full) <- rownames(data_selected)
+theta_abstract_full[rownames(theta_abstract_new), ] <- theta_abstract_new
+
+theta_title_full <- matrix(
+  0,
+  nrow = n,
+  ncol = ncol(theta_title_new)
+)
+rownames(theta_title_full) <- rownames(data_selected)
+theta_title_full[rownames(theta_title_new), ] <- theta_title_new
+
+# 2.Merge features
+cluster_data <- cbind(theta_title_full, theta_abstract_full)
+
+# standardization for both K-means and PCA
+cluster_data_scaled <- scale(cluster_data)
+
+# 3.K-means clustering
+set.seed(123)
+k <- 5
+km_res <- kmeans(cluster_data_scaled, centers = k, nstart = 25)
+
+data_selected$cluster <- factor(km_res$cluster)
+
+
+# Top-N topics per cluster
+top_n_topics_by_cluster <- function(theta_matrix, cluster_labels, n = 5) {
+  clusters <- sort(unique(cluster_labels))
+  
+  result <- lapply(clusters, function(cl) {
+    rows <- which(cluster_labels == cl)
+    cluster_mean <- colMeans(theta_matrix[rows, , drop = FALSE])
+    top_topics <- order(cluster_mean, decreasing = TRUE)[1:n]
+    
+    data.frame(
+      cluster = cl,
+      topic_index = top_topics,
+      mean_proportion = cluster_mean[top_topics]
+    )
+  })
+  
+  do.call(rbind, result)
+}
+
+# Compute top topics
+top_title_topics <- top_n_topics_by_cluster(
+  theta_title_full,
+  data_selected$cluster,
+  n = 5
+)
+
+top_abstract_topics <- top_n_topics_by_cluster(
+  theta_abstract_full,
+  data_selected$cluster,
+  n = 5
+)
+
+# 4.PCA dimensionality reduction(for visualization)
+pca_res <- prcomp(
+  cluster_data_scaled,
+  center = TRUE,
+  scale. = TRUE
+)
+
+# Extract the first two principal components
+pca_df <- data.frame(
+  PC1 = pca_res$x[, 1],
+  PC2 = pca_res$x[, 2],
+  cluster = data_selected$cluster
+)
+
+# Inspect results
+print(top_title_topics)
+print(top_abstract_topics)
+
+# 5.PCA 2D visualization
+ggplot(pca_df, aes(x = cluster, y = PC1)) +
+  geom_boxplot(fill = "lightblue") +
+  theme_minimal() +
+  labs(title = "Distribution of PC1 by Cluster")
+
+ggplot(pca_df, aes(x = cluster, y = PC2)) +
+  geom_boxplot(fill = "lightgreen") +
+  theme_minimal() +
+  labs(title = "Distribution of PC2 by Cluster")
+
+```
+
+# Hierarchical Cluster and Visualization
+
+```{r}
+n <- nrow(data_selected)
+
+# ===============================
+# 1.Align rows: pad with zeros
+# ===============================
+theta_abstract_full <- matrix(
+  0,
+  nrow = n,
+  ncol = ncol(theta_abstract_new)
+)
+rownames(theta_abstract_full) <- rownames(data_selected)
+theta_abstract_full[rownames(theta_abstract_new), ] <- theta_abstract_new
+
+theta_title_full <- matrix(
+  0,
+  nrow = n,
+  ncol = ncol(theta_title_new)
+)
+rownames(theta_title_full) <- rownames(data_selected)
+theta_title_full[rownames(theta_title_new), ] <- theta_title_new
+
+# ===============================
+# 2.Merge features and standardize
+# ===============================
+cluster_data <- cbind(theta_title_full, theta_abstract_full)
+cluster_data_scaled <- scale(cluster_data)
+
+# ===============================
+# 3.Hierarchical clustering
+# ===============================
+
+# Distance matrix (Euclidean distance, consistent with K-means)
+dist_mat <- dist(cluster_data_scaled, method = "euclidean")
+
+# Hierarchical clustering (Ward's method, commonly used and robust)
+hc_res <- hclust(dist_mat, method = "ward.D2")
+
+# Plot the dendrogram
+plot(
+  hc_res,
+  labels = FALSE,
+  main = "Hierarchical Clustering Dendrogram",
+  xlab = "",
+  sub = ""
+)
+
+# Specify the number of clusters (consistent with k = 5)
+k <- 5
+hc_clusters <- cutree(hc_res, k = k)
+
+data_selected$cluster <- factor(hc_clusters)
+
+# ===============================
+# 4.Top-N topics per cluster
+# ===============================
+
+top_n_topics_by_cluster <- function(theta_matrix, cluster_labels, n = 5) {
+  clusters <- sort(unique(cluster_labels))
+  
+  result <- lapply(clusters, function(cl) {
+    rows <- which(cluster_labels == cl)
+    cluster_mean <- colMeans(theta_matrix[rows, , drop = FALSE])
+    top_topics <- order(cluster_mean, decreasing = TRUE)[1:n]
+    
+    data.frame(
+      cluster = cl,
+      topic_index = top_topics,
+      mean_proportion = cluster_mean[top_topics]
+    )
+  })
+  
+  do.call(rbind, result)
+}
+
+top_title_topics <- top_n_topics_by_cluster(
+  theta_title_full,
+  data_selected$cluster,
+  n = 5
+)
+
+top_abstract_topics <- top_n_topics_by_cluster(
+  theta_abstract_full,
+  data_selected$cluster,
+  n = 5
+)
+
+# ===============================
+# 5.PCA for visualization only
+# ===============================
+pca_res <- prcomp(
+  cluster_data_scaled,
+  center = TRUE,
+  scale. = TRUE
+)
+
+pca_df <- data.frame(
+  PC1 = pca_res$x[, 1],
+  PC2 = pca_res$x[, 2],
+  cluster = data_selected$cluster
+)
+
+# ===============================
+# 6.PCA + boxplots
+# ===============================
+ggplot(pca_df, aes(x = cluster, y = PC1)) +
+  geom_boxplot(fill = "lightblue") +
+  theme_minimal() +
+  labs(title = "Distribution of PC1 by Cluster (Hierarchical)")
+
+ggplot(pca_df, aes(x = cluster, y = PC2)) +
+  geom_boxplot(fill = "lightgreen") +
+  theme_minimal() +
+  labs(title = "Distribution of PC2 by Cluster (Hierarchical)")
+
+# ===============================
+# 7.Inspect results
+# ===============================
+print(top_title_topics)
+print(top_abstract_topics)
+
+```
+
+# Topic Gini Analysis
+
+```{r}
+
+# -------------------------------
+# Title: Topic concentration per document (Gini coefficient)
+# -------------------------------
+theta_title_gini <- apply(theta_title_new, 1, ineq::Gini)
+
+title_gini_df <- data.frame(
+  DocID = 1:length(theta_title_gini),
+  Gini = theta_title_gini
+)
+
+ggplot(title_gini_df, aes(x = DocID, y = Gini)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Document-wise Topic Concentration (Title) - Gini Coefficient",
+    x = "Document ID",
+    y = "Gini Coefficient"
+  ) +
+  theme_minimal()
+
+# -------------------------------
+# Abstract: Topic concentration per document (Gini coefficient)
+# -------------------------------
+theta_abs_gini <- apply(theta_abstract_new, 1, ineq::Gini)
+
+abs_gini_df <- data.frame(
+  DocID = 1:length(theta_abs_gini),
+  Gini = theta_abs_gini
+)
+
+ggplot(abs_gini_df, aes(x = DocID, y = Gini)) +
+  geom_bar(stat = "identity", fill = "darkorange") +
+  labs(
+    title = "Document-wise Topic Concentration (Abstract) - Gini Coefficient",
+    x = "Document ID",
+    y = "Gini Coefficient"
+  ) +
+  theme_minimal()
+
+```
+
+# Topic one-hot coding
+
+```{r}
+# -------------------------------
+# Helper: Find dominant topics
+# -------------------------------
+get_dominant_topics <- function(theta, threshold = 0.5) {
+  lapply(1:nrow(theta), function(i) {
+    p <- theta[i, ]
+    o <- order(p, decreasing = TRUE)
+    cum_sum <- cumsum(p[o])
+    keep <- o[cum_sum <= threshold]
+    if (length(keep) == 0) keep <- o[1]
+    return(keep)
+  })
+}
+
+# -------------------------------
+# 1. Dominant topics for Title
+# -------------------------------
+title_dom <- get_dominant_topics(theta_title_new, threshold = 0.5)
+
+# -------------------------------
+# 2. Dominant topics for Abstract
+# -------------------------------
+abs_dom <- get_dominant_topics(theta_abstract_new, threshold = 0.5)
+
+# -------------------------------
+# 3. Combine dominant topics from Title + Abstract
+# -------------------------------
+combined_dom <- mapply(
+  function(t, a) sort(unique(c(t, a))),
+  title_dom, abs_dom,
+  SIMPLIFY = FALSE
+)
+
+# -------------------------------
+# 4. Build overall one-hot encoding
+# -------------------------------
+# Number of possible topics
+num_title <- ncol(theta_title_new)
+num_abs   <- ncol(theta_abstract_new)
+
+# Create unique column names: Title_1..Title_K, Abstract_1..Abstract_K
+all_topic_names <- c(
+  paste0("Title_", 1:num_title),
+  paste0("Abstract_", 1:num_abs)
+)
+
+# Initialize one-hot matrix
+onehot_mat <- matrix(
+  0,
+  nrow = length(combined_dom),
+  ncol = length(all_topic_names)
+)
+colnames(onehot_mat) <- all_topic_names
+
+# Fill one-hot matrix
+for (i in seq_along(combined_dom)) {
+  idx <- combined_dom[[i]]
+  # Separate title and abstract indices
+  title_idx <- idx[idx <= num_title]
+  abs_idx   <- idx[idx > num_title] - num_title
+  if (length(title_idx) > 0) onehot_mat[i, paste0("Title_", title_idx)] <- 1
+  if (length(abs_idx) > 0)   onehot_mat[i, paste0("Abstract_", abs_idx)] <- 1
+}
+
+onehot_df <- as.data.frame(onehot_mat)
+
+# Merge with original data
+data_features <- cbind(data_selected, onehot_df)
+
+# Check invalid columns (example)
+which(data_features$Abstract_11==1) 
+which(data_features$Abstract_12==1)
+which(data_features$Abstract_13==1)
+which(data_features$Abstract_14==1) 
+which(data_features$Abstract_15==1) 
+which(data_features$Abstract_16==1)
+which(data_features$Abstract_17==1)
+which(data_features$Abstract_18==1)
+which(data_features$Abstract_19==1)
+which(data_features$Abstract_20==1) 
+
+# Remove all-zero columns and merge with original data
+onehot_df_reduced <- onehot_df[, colSums(onehot_df) > 0]
+data_features_reduced <- cbind(data_selected, onehot_df_reduced)
+
+```
+
+# Views and pages bins generation
+
+```{r}
+
+# -------------------------------
+# 1. Clean and convert views / pages
+# -------------------------------
+data_features_reduced$views <- gsub(",", "", trimws(data_features_reduced$views))
+data_features_reduced$views <- as.numeric(data_features_reduced$views)
+
+data_features_reduced$pages <- gsub(",", "", trimws(data_features_reduced$pages))
+data_features_reduced$pages <- as.numeric(data_features_reduced$pages)
+
+# -------------------------------
+# 2. Set the number of bins
+# -------------------------------
+num_bins <- 5  # Can be adjusted as needed
+
+# -------------------------------
+# 3. Perform equal-width binning for views and pages
+# -------------------------------
+data_features_reduced$views_bin <- cut(
+  data_features_reduced$views,
+  breaks = num_bins,
+  include.lowest = TRUE,
+  labels = paste0("bin_", 1:num_bins)
+)
+
+data_features_reduced$pages_bin <- cut(
+  data_features_reduced$pages,
+  breaks = num_bins,
+  include.lowest = TRUE,
+  labels = paste0("bin_", 1:num_bins)
+)
+
+```
+
+# Association and Interpretation
+
+```{r}
+
+# -------------------------------
+# 1. Identify Title / Abstract topic columns
+# -------------------------------
+title_cols <- grep("^Title_\\d+$", names(data_features_reduced), value = TRUE)
+abstract_cols <- grep("^Abstract_\\d+$", names(data_features_reduced), value = TRUE)
+
+# -------------------------------
+# 2. Build transaction list
+# -------------------------------
+transactions_list <- lapply(1:nrow(data_features_reduced), function(i) {
+  c(
+    # Title topics
+    names(data_features_reduced[i, title_cols])[data_features_reduced[i, title_cols] == 1],
+    # Abstract topics
+    names(data_features_reduced[i, abstract_cols])[data_features_reduced[i, abstract_cols] == 1],
+    # pages_bin
+    paste0("pages=", data_features_reduced$pages_bin[i]),
+    # views_bin
+    paste0("views=", data_features_reduced$views_bin[i])
+  )
+})
+
+# -------------------------------
+# 3. Convert to transactions object
+# -------------------------------
+trans_all <- as(transactions_list, "transactions")
+
+# -------------------------------
+# 4. Define high-traffic views bins
+# -------------------------------
+high_views_bins <- paste0("views=", c("bin_4", "bin_5"))
+
+# -------------------------------
+# 5. Apply Apriori algorithm to mine high-traffic rules
+# -------------------------------
+rules <- apriori(
+  trans_all,
+  parameter = list(supp = 0.0001, conf = 0.02, minlen = 1),
+  appearance = list(rhs = high_views_bins, default = "lhs")
+)
+
+# -------------------------------
+# 6. Export rule metrics
+# -------------------------------
+rules_df <- as(rules, "data.frame")
+rules_df <- rules_df[, c("rules", "support", "confidence", "lift")]
+
+# -------------------------------
+# 7. Inspect top rules
+# -------------------------------
+head(rules_df)
+
+```
+
+# Skewed Dataset Demonstration
+
+```{r}
+data_selected_show <- data_selected %>% 
+  select(views, doc_number) %>%
+  # Remove spaces and commas, convert to numeric
+  mutate(views = as.numeric(gsub("[ ,]", "", views))) %>%
+  arrange(desc(views))  # Sort by views in descending order
+
+# Plot bar chart
+ggplot(data_selected_show, aes(x = reorder(doc_number, -views), y = views)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    x = "Document Number",
+    y = "Views",
+    title = "Article Views by Document Number"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
